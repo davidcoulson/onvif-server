@@ -1,151 +1,152 @@
-const soap = require('soap');
-const uuid = require('node-uuid');
+import soap from 'soap';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
-function extractPath(url) {
-    return url.substr(url.indexOf('/', url.indexOf('//') + 2));
+const MEDIA_WSDL = path.join(import.meta.dirname, '..', 'wsdl', 'media_service.wsdl');
+
+/** Strips scheme+authority, keeping the path (and query) the camera serves. */
+export function extractPath(uri) {
+    const parsed = new URL(uri);
+    return `${parsed.pathname}${parsed.search}`;
 }
 
-async function createConfig(hostname, username, password) {
-    let options = {
-        forceSoap12Headers: true
-    };
+function faultMessage(error) {
+    const text = error?.root?.Envelope?.Body?.Fault?.Reason?.Text;
+    if (text) return text.$value ?? String(text);
+    return error?.message ?? String(error);
+}
 
-    let securityOptions = {
-        hasNonce: true,
-        passwordType: 'PasswordDigest'
-    };
-    
-    let client = await soap.createClientAsync('./wsdl/media_service.wsdl', options);
-    client.setEndpoint(`http://${hostname}/onvif/device_service`);
-    client.setSecurity(new soap.WSSecurity(username, password, securityOptions));
+/** Picks whichever of the two profiles is actually the higher-quality one. */
+function orderStreams(profiles) {
+    let main = profiles[0];
+    let sub = profiles[profiles.length > 1 ? 1 : 0];
 
-    let hostport = 80;
-    if (hostname.indexOf(':') > -1) {
-        hostport = parseInt(hostname.substr(hostname.indexOf(':') + 1));
-        hostname = hostname.substr(0, hostname.indexOf(':'));
+    const mainEncoder = main.VideoEncoderConfiguration;
+    const subEncoder = sub.VideoEncoderConfiguration;
+
+    const subIsBetter =
+        subEncoder.Quality > mainEncoder.Quality ||
+        (subEncoder.Quality === mainEncoder.Quality &&
+            subEncoder.Resolution.Width > mainEncoder.Resolution.Width);
+
+    if (subIsBetter) [main, sub] = [sub, main];
+
+    return { main, sub };
+}
+
+function streamConfig(profile, quality) {
+    const encoder = profile.VideoEncoderConfiguration;
+    return {
+        rtsp: extractPath(profile.streamUri),
+        snapshot: extractPath(profile.snapshotUri),
+        width: encoder.Resolution.Width,
+        height: encoder.Resolution.Height,
+        framerate: encoder.RateControl.FrameRateLimit,
+        bitrate: encoder.RateControl.BitrateLimit,
+        quality,
+    };
+}
+
+async function probeCamera(hostname, username, password) {
+    const client = await soap.createClientAsync(MEDIA_WSDL, { forceSoap12Headers: true });
+
+    let host = hostname;
+    let hostPort = 80;
+    if (host.includes(':')) {
+        hostPort = Number.parseInt(host.slice(host.indexOf(':') + 1), 10);
+        host = host.slice(0, host.indexOf(':'));
     }
 
-    let cameras = {};
+    client.setEndpoint(`http://${hostname}/onvif/device_service`);
+    client.setSecurity(
+        new soap.WSSecurity(username, password, { hasNonce: true, passwordType: 'PasswordDigest' }),
+    );
+
+    const cameras = new Map();
 
     try {
-        let profiles = await client.GetProfilesAsync({});
-        for (let profile of profiles[0].Profiles) {
-            let videoSource = profile.VideoSourceConfiguration.SourceToken;
+        const [profiles] = await client.GetProfilesAsync({});
 
-            if (!cameras[videoSource])
-                cameras[videoSource] = [];
+        for (const profile of profiles.Profiles) {
+            const videoSource = profile.VideoSourceConfiguration.SourceToken;
 
-            let snapshotUri = await client.GetSnapshotUriAsync({
-                ProfileToken: profile.attributes.token
+            const [snapshotUri] = await client.GetSnapshotUriAsync({
+                ProfileToken: profile.attributes.token,
             });
 
-            let streamUri = await client.GetStreamUriAsync({
-                StreamSetup: {
-                    Stream: 'RTP-Unicast',
-                    Transport: {
-                        Protocol: 'RTSP'
-                    }
-                },
-                ProfileToken: profile.attributes.token
+            const [streamUri] = await client.GetStreamUriAsync({
+                StreamSetup: { Stream: 'RTP-Unicast', Transport: { Protocol: 'RTSP' } },
+                ProfileToken: profile.attributes.token,
             });
 
-            profile.streamUri = streamUri[0].MediaUri.Uri;
-            profile.snapshotUri = snapshotUri[0].MediaUri.Uri;
-            cameras[videoSource].push(profile);
+            profile.streamUri = streamUri.MediaUri.Uri;
+            profile.snapshotUri = snapshotUri.MediaUri.Uri;
+
+            if (!cameras.has(videoSource)) cameras.set(videoSource, []);
+            cameras.get(videoSource).push(profile);
         }
-    } catch (err) {
-        if (err.root && err.root.Envelope && err.root.Envelope.Body && err.root.Envelope.Body.Fault && err.root.Envelope.Body.Fault.Reason && err.root.Envelope.Body.Fault.Reason.Text)
-            throw `Error: ${err.root.Envelope.Body.Fault.Reason.Text['$value']}`;
-        throw `Error: ${err.message}`;
+    } catch (error) {
+        throw new Error(faultMessage(error), { cause: error });
     }
 
-    let config = {
-        onvif: []
-    };
-
+    const config = { onvif: [] };
     let serverPort = 8081;
-    for (let camera in cameras) {
-        let mainStream = cameras[camera][0];
-        let subStream = cameras[camera][cameras[camera].length > 1 ? 1 : 0];
 
-        let swapStreams = false;
-        if (subStream.VideoEncoderConfiguration.Quality > mainStream.VideoEncoderConfiguration.Quality)
-            swapStreams = true;
-        else if (subStream.VideoEncoderConfiguration.Quality == mainStream.VideoEncoderConfiguration.Quality)
-            if (subStream.VideoEncoderConfiguration.Resolution.Width > mainStream.VideoEncoderConfiguration.Resolution.Width)
-                swapStreams = true;
+    for (const profiles of cameras.values()) {
+        const { main, sub } = orderStreams(profiles);
 
-        if (swapStreams) {
-            let tempStream = subStream;
-            subStream = mainStream;
-            mainStream = tempStream;
-        }
-
-        let cameraConfig = {
+        config.onvif.push({
             mac: '<ONVIF PROXY MAC ADDRESS HERE>',
-            ports: {
-                server: serverPort,
-                rtsp: 8554,
-                snapshot: 8580
-            },
-            name: mainStream.VideoSourceConfiguration.Name,
-            uuid: uuid.v4(),
-            highQuality: {
-                rtsp: extractPath(mainStream.streamUri),
-                snapshot: extractPath(mainStream.snapshotUri),
-                width: mainStream.VideoEncoderConfiguration.Resolution.Width,
-                height: mainStream.VideoEncoderConfiguration.Resolution.Height,
-                framerate: mainStream.VideoEncoderConfiguration.RateControl.FrameRateLimit,
-                bitrate: mainStream.VideoEncoderConfiguration.RateControl.BitrateLimit,
-                quality: 4.0
-            },
-            lowQuality: {
-                rtsp: extractPath(subStream.streamUri),
-                snapshot: extractPath(subStream.snapshotUri),
-                width: subStream.VideoEncoderConfiguration.Resolution.Width,
-                height: subStream.VideoEncoderConfiguration.Resolution.Height,
-                framerate: subStream.VideoEncoderConfiguration.RateControl.FrameRateLimit,
-                bitrate: subStream.VideoEncoderConfiguration.RateControl.BitrateLimit,
-                quality: 1.0
-            },
-            target: {
-                hostname: hostname,
-                ports: {
-                    rtsp: 554,
-                    snapshot: hostport
-                }
-            }
-        };
+            ports: { server: serverPort, rtsp: 8554, snapshot: 8580 },
+            name: main.VideoSourceConfiguration.Name,
+            uuid: randomUUID(),
+            highQuality: streamConfig(main, 4.0),
+            lowQuality: streamConfig(sub, 1.0),
+            target: { hostname: host, ports: { rtsp: 554, snapshot: hostPort } },
+        });
 
-        config.onvif.push(cameraConfig);
         serverPort++;
     }
 
     return config;
 }
 
-exports.createConfig = async function(hostname, username, password) {
+/**
+ * Some cameras reject our WS-Security timestamp as skewed ("time check failed").
+ * The original worked around this by permanently overwriting
+ * Date.prototype.getUTCHours for the life of the process; here the patch is
+ * scoped to the retry and always restored.
+ */
+async function withUtcHourOffset(hours, fn) {
+    const original = Date.prototype.getUTCHours;
+    const shifted = new Date().getUTCHours() + hours;
 
-    let config;
+    Date.prototype.getUTCHours = function getUTCHours() {
+        return shifted;
+    };
+
     try {
-        config = await createConfig(hostname, username, password);
-    } catch (err) {
-        console.log(err);
-        if (err.includes('time check failed')) {
-            console.log('Retrying...')
+        return await fn();
+    } finally {
+        Date.prototype.getUTCHours = original;
+    }
+}
 
-            var utcHours = (new Date()).getUTCHours();
-            Date.prototype.getUTCHours = function() {
-                return utcHours + 1;
-            }
+export async function createConfig(hostname, username, password, logger = console) {
+    try {
+        return await probeCamera(hostname, username, password);
+    } catch (error) {
+        logger.error?.(error.message) ?? console.error(error.message);
 
-            try {
-                config = await createConfig(hostname, username, password);
-            } catch (err) {
-                console.log(err);
-            }
+        if (!error.message.includes('time check failed')) return null;
+
+        logger.info?.('Clock skew rejected by the camera, retrying with a shifted timestamp...');
+
+        try {
+            return await withUtcHourOffset(1, () => probeCamera(hostname, username, password));
+        } catch (retryError) {
+            logger.error?.(retryError.message) ?? console.error(retryError.message);
+            return null;
         }
     }
-
-    return config;
 }

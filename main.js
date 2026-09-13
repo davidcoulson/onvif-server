@@ -1,129 +1,224 @@
-const tcpProxy = require('node-tcp-proxy');
-const onvifServer = require('./src/onvif-server');
-const configBuilder = require('./src/config-builder');
-const package = require('./package.json');
-const argparse = require('argparse');
-const readline = require('readline');
-const stream = require('stream');
-const yaml = require('yaml');
-const fs = require('fs');
-const simpleLogger = require('simple-node-logger-se');
+import { parseArgs } from 'node:util';
+import readline from 'node:readline/promises';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import process from 'node:process';
+import yaml from 'yaml';
 
-const parser = new argparse.ArgumentParser({
-    description: 'Virtual Onvif Server'
-});
+import { createServer } from './src/onvif-server.js';
+import { createConfig } from './src/config-builder.js';
+import { validateConfig } from './src/config-schema.js';
+import { TcpProxy } from './src/tcp-proxy.js';
+import { createLogger } from './src/logger.js';
 
-parser.add_argument('-v', '--version', { action: 'store_true', help: 'show the version information' });
-parser.add_argument('-cc', '--create-config', { action: 'store_true', help: 'create a new config' });
-parser.add_argument('-d', '--debug', { action: 'store_true', help: 'show onvif requests' });
-parser.add_argument('config', { help: 'config filename to use', nargs: '?'});
+const USAGE = `Virtual Onvif Server
 
-let args = parser.parse_args();
+Usage: node main.js [options] <config>
 
-if (args) {
-    const logger = simpleLogger.createSimpleLogger();
-    if (args.debug)
-        logger.setLevel('trace');
+Options:
+  -v, --version        show the version information
+  -cc, --create-config create a new config by probing a real Onvif camera
+  -d, --debug          show onvif requests
+  -h, --help           show this help
+`;
 
-    if (args.version) {
-        logger.info('Version: ' + package.version);
-        return;
+async function readVersion() {
+    const file = path.join(import.meta.dirname, 'package.json');
+    return JSON.parse(await fs.readFile(file, 'utf8')).version;
+}
+
+async function runCreateConfig(logger) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    try {
+        const hostname = await rl.question('Onvif Server: ');
+        const username = await rl.question('Onvif Username: ');
+        const password = await rl.question('Onvif Password: ');
+
+        logger.info('Generating config ...');
+
+        const config = await createConfig(hostname, username, password, logger);
+
+        if (!config) {
+            logger.error('Failed to create config!');
+            return 1;
+        }
+
+        process.stdout.write('# ==================== CONFIG START ====================\n');
+        process.stdout.write(`${yaml.stringify(config)}\n`);
+        process.stdout.write('# ===================== CONFIG END =====================\n');
+        return 0;
+    } finally {
+        rl.close();
+    }
+}
+
+async function loadConfig(file, logger) {
+    let raw;
+    try {
+        raw = await fs.readFile(file, 'utf8');
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            logger.error(`File not found: ${file}`);
+            return null;
+        }
+        throw error;
     }
 
-    if (args.create_config) {
-        let mutableStdout = new stream.Writable({
-            write: function(chunk, encoding, callback) {
-                if (!this.muted || chunk.toString().includes('\n'))
-                    process.stdout.write(chunk, encoding);
-                callback();
-            }
-        });
+    let config;
+    try {
+        config = yaml.parse(raw);
+    } catch (error) {
+        logger.error(`Failed to read config, invalid yaml syntax: ${error.message}`);
+        return null;
+    }
 
-        const rl = readline.createInterface({
-            input: process.stdin,
-            output: mutableStdout,
-            terminal: true
-        });
+    const problems = validateConfig(config);
+    if (problems.length > 0) {
+        logger.error(`Config is not valid (${problems.length} problem${problems.length === 1 ? '' : 's'}):`);
+        for (const problem of problems) logger.error(`  ${problem}`);
+        return null;
+    }
 
-        mutableStdout.muted = false;
-        rl.question('Onvif Server: ', (hostname) => {
-            rl.question('Onvif Username: ', (username) => {
-                mutableStdout.muted = true;
-                process.stdout.write('Onvif Password: ');
-                rl.question('', (password) => {
-                    console.log('Generating config ...');
-                    configBuilder.createConfig(hostname, username, password).then((config) => {
-                        if (config) {
-                            console.log('# ==================== CONFIG START ====================');
-                            console.log(yaml.stringify(config));
-                            console.log('# ===================== CONFIG END =====================');
-                        } else
-                        console.log('Failed to create config!');
-                    });
-                    rl.close();
-                });
+    return config;
+}
+
+async function runServers(config, { debug, logger }) {
+    const servers = [];
+    const proxies = [];
+
+    // hostname -> listenPort -> targetPort, so several channels of one physical
+    // camera share a single set of forwarders.
+    const forwards = new Map();
+
+    for (const cameraConfig of config.onvif) {
+        const cameraLogger = logger.child({ camera: cameraConfig.name });
+        const server = createServer(cameraConfig, cameraLogger);
+
+        if (!server.getHostname()) {
+            cameraLogger.error(`Failed to find IP address for MAC address ${cameraConfig.mac}`);
+            await shutdown(servers, proxies);
+            return 1;
+        }
+
+        cameraLogger.info(`starting virtual onvif server on ${server.getHostname()}:${cameraConfig.ports.server}`);
+
+        try {
+            await server.startServer();
+        } catch (error) {
+            cameraLogger.error(`failed to start: ${error.message}`, { code: error.code });
+            await shutdown(servers, proxies);
+            return 1;
+        }
+
+        server.startDiscovery();
+        if (debug) server.enableDebugOutput();
+        servers.push(server);
+
+        const target = cameraConfig.target.hostname;
+        if (!forwards.has(target)) forwards.set(target, new Map());
+
+        if (cameraConfig.ports.rtsp && cameraConfig.target.ports.rtsp)
+            forwards.get(target).set(cameraConfig.ports.rtsp, { targetPort: cameraConfig.target.ports.rtsp, host: server.getHostname() });
+
+        if (cameraConfig.ports.snapshot && cameraConfig.target.ports.snapshot)
+            forwards.get(target).set(cameraConfig.ports.snapshot, { targetPort: cameraConfig.target.ports.snapshot, host: server.getHostname() });
+    }
+
+    for (const [targetHost, ports] of forwards) {
+        for (const [listenPort, { targetPort, host }] of ports) {
+            const proxy = new TcpProxy({
+                listenHost: host,
+                listenPort,
+                targetHost,
+                targetPort,
+                logger,
             });
-        });
 
-    } else if (args.config) {
-        let configData;
-        try {
-            configData = fs.readFileSync(args.config, 'utf8');
-        } catch (error) {
-            if (error.code === 'ENOENT') {
-                logger.error('File not found: ' + args.config);
-                return -1;
+            logger.info(`starting tcp proxy ${host}:${listenPort} -> ${targetHost}:${targetPort}`);
+
+            try {
+                await proxy.listen();
+            } catch (error) {
+                logger.error(`failed to start tcp proxy on port ${listenPort}: ${error.message}`, { code: error.code });
+                await shutdown(servers, [...proxies, proxy]);
+                return 1;
             }
-            throw error;
+
+            proxies.push(proxy);
         }
-
-        let config;
-        try {
-            config = yaml.parse(configData);
-        } catch (error) {
-            logger.error('Failed to read config, invalid yaml syntax.')
-            return -1;
-        }
-
-        let proxies = {};
-
-        for (let onvifConfig of config.onvif) {
-            let server = onvifServer.createServer(onvifConfig, logger);
-            if (server.getHostname()) {
-                logger.info(`Starting virtual onvif server for ${onvifConfig.name} on ${server.getHostname()}:${onvifConfig.ports.server} ...`);
-                server.startServer();
-                server.startDiscovery();
-                if (args.debug)
-                    server.enableDebugOutput();
-                logger.info('  Started!');
-                logger.info('');
-
-                if (!proxies[onvifConfig.target.hostname])
-                    proxies[onvifConfig.target.hostname] = {}
-                
-                if (onvifConfig.ports.rtsp && onvifConfig.target.ports.rtsp)
-                    proxies[onvifConfig.target.hostname][onvifConfig.ports.rtsp] = onvifConfig.target.ports.rtsp;
-                if (onvifConfig.ports.snapshot && onvifConfig.target.ports.snapshot)
-                    proxies[onvifConfig.target.hostname][onvifConfig.ports.snapshot] = onvifConfig.target.ports.snapshot;
-            } else {
-                logger.error(`Failed to find IP address for MAC address ${onvifConfig.mac}`)
-                return -1;
-            }
-        }
-        
-        for (let destinationAddress in proxies) {
-            for (let sourcePort in proxies[destinationAddress]) {
-                logger.info(`Starting tcp proxy from port ${sourcePort} to ${destinationAddress}:${proxies[destinationAddress][sourcePort]} ...`);
-                tcpProxy.createProxy(sourcePort, destinationAddress, proxies[destinationAddress][sourcePort]);
-                logger.info('  Started!');
-                logger.info('');
-            }
-        }
-
-    } else {
-        logger.error('Please specifiy a config filename!');
-        return -1;
     }
 
+    logger.info(`ready — ${servers.length} virtual camera${servers.length === 1 ? '' : 's'}, ${proxies.length} tcp proxies`);
+
+    await waitForShutdownSignal(logger);
+    await shutdown(servers, proxies);
     return 0;
 }
+
+function waitForShutdownSignal(logger) {
+    return new Promise((resolve) => {
+        const stop = (signal) => {
+            logger.info(`received ${signal}, shutting down`);
+            resolve();
+        };
+        process.once('SIGINT', () => stop('SIGINT'));
+        process.once('SIGTERM', () => stop('SIGTERM'));
+    });
+}
+
+async function shutdown(servers, proxies) {
+    await Promise.allSettled([
+        ...servers.map((server) => server.close()),
+        ...proxies.map((proxy) => proxy.close()),
+    ]);
+}
+
+async function main() {
+    let parsed;
+    try {
+        parsed = parseArgs({
+            options: {
+                version: { type: 'boolean', short: 'v', default: false },
+                'create-config': { type: 'boolean', default: false },
+                debug: { type: 'boolean', short: 'd', default: false },
+                help: { type: 'boolean', short: 'h', default: false },
+            },
+            allowPositionals: true,
+            // Keep the original "-cc" spelling working.
+            args: process.argv.slice(2).map((arg) => (arg === '-cc' ? '--create-config' : arg)),
+        });
+    } catch (error) {
+        process.stderr.write(`${error.message}\n\n${USAGE}`);
+        return 1;
+    }
+
+    const { values, positionals } = parsed;
+    const logger = createLogger({ level: values.debug ? 'trace' : 'info' });
+
+    if (values.help) {
+        process.stdout.write(USAGE);
+        return 0;
+    }
+
+    if (values.version) {
+        process.stdout.write(`${await readVersion()}\n`);
+        return 0;
+    }
+
+    if (values['create-config']) return runCreateConfig(logger);
+
+    const configFile = positionals[0];
+    if (!configFile) {
+        logger.error('Please specify a config filename!');
+        process.stderr.write(`\n${USAGE}`);
+        return 1;
+    }
+
+    const config = await loadConfig(configFile, logger);
+    if (!config) return 1;
+
+    return runServers(config, { debug: values.debug, logger });
+}
+
+process.exitCode = await main();
