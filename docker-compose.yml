@@ -1,0 +1,59 @@
+# One container per virtual Onvif device.
+#
+# Docker's macvlan driver gives each container its own MAC and IP on your LAN
+# natively, which replaces the upstream approach of creating `ip link` macvlan
+# interfaces on the host by hand. This survives reboots and is declarative.
+#
+# Before you start:
+#   1. Set `parent` below to your host's LAN interface (ip -br link).
+#   2. Set subnet/gateway to match your LAN, and ip_range to a slice your DHCP
+#      server does NOT hand out.
+#   3. Give each service an IP from that range and a matching config file.
+#
+# Note: with macvlan the Docker host itself cannot reach these containers.
+# That is fine here - UniFi Protect lives on another machine. If you need host
+# access, add a macvlan shim interface on the host.
+
+name: onvif-server
+
+x-onvif: &onvif
+  build: .
+  # image: ghcr.io/davidcoulson/onvif-server:latest
+  restart: unless-stopped
+  environment:
+    LOG_FORMAT: json
+  healthcheck:
+    test: ["CMD", "node", "-e", "process.exit(0)"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+
+networks:
+  onvif:
+    driver: macvlan
+    driver_opts:
+      parent: eth0
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24
+          gateway: 192.168.1.1
+          ip_range: 192.168.1.240/28
+
+services:
+  front-door:
+    <<: *onvif
+    mac_address: a2:a2:a2:a2:a2:a1
+    networks:
+      onvif:
+        ipv4_address: 192.168.1.241
+    volumes:
+      - ./examples/config/front-door.yaml:/onvif.yaml:ro
+
+  back-garden:
+    <<: *onvif
+    mac_address: a2:a2:a2:a2:a2:a2
+    networks:
+      onvif:
+        ipv4_address: 192.168.1.242
+    volumes:
+      - ./examples/config/back-garden.yaml:/onvif.yaml:ro

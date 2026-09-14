@@ -419,11 +419,15 @@ class OnvifServer {
     async close() {
         const closers = [];
 
-        if (this.#discoverySocket)
-            closers.push(new Promise((resolve) => this.#discoverySocket.close(resolve)));
+        // Null the handles as we go: dgram.close() on an already-closed socket
+        // throws, so a second close() must be a no-op rather than a surprise.
+        const socket = this.#discoverySocket;
+        this.#discoverySocket = undefined;
+        if (socket) closers.push(new Promise((resolve) => socket.close(resolve)));
 
-        if (this.#server)
-            closers.push(new Promise((resolve) => this.#server.close(resolve)));
+        const server = this.#server;
+        this.#server = undefined;
+        if (server) closers.push(new Promise((resolve) => server.close(resolve)));
 
         await Promise.allSettled(closers);
     }

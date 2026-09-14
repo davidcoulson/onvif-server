@@ -1,5 +1,6 @@
 import { parseArgs } from 'node:util';
 import readline from 'node:readline/promises';
+import { Writable } from 'node:stream';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -27,13 +28,35 @@ async function readVersion() {
     return JSON.parse(await fs.readFile(file, 'utf8')).version;
 }
 
+/**
+ * A readline interface whose echo can be suppressed, so the Onvif password is
+ * not printed to the terminal as it is typed. v1 did this with a muted stream;
+ * the promises API needs the same treatment.
+ */
+function createPrompt() {
+    let muted = false;
+    const output = new Writable({
+        write(chunk, encoding, callback) {
+            if (!muted) process.stdout.write(chunk, encoding);
+            callback();
+        },
+    });
+    const rl = readline.createInterface({ input: process.stdin, output, terminal: true });
+    return { rl, setMuted: (value) => { muted = value; } };
+}
+
 async function runCreateConfig(logger) {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const { rl, setMuted } = createPrompt();
 
     try {
         const hostname = await rl.question('Onvif Server: ');
         const username = await rl.question('Onvif Username: ');
-        const password = await rl.question('Onvif Password: ');
+
+        process.stdout.write('Onvif Password: ');
+        setMuted(true);
+        const password = await rl.question('');
+        setMuted(false);
+        process.stdout.write('\n');
 
         logger.info('Generating config ...');
 

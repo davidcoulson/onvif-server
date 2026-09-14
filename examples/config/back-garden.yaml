@@ -1,0 +1,41 @@
+# One virtual Onvif device per container, so each file holds exactly one camera.
+#
+# `hostname` must match the container's ipv4_address in docker-compose.yml.
+# You can use `mac:` instead and the server will look the IP up from the
+# interface - with one container per camera either works, but hostname is
+# explicit and needs no lookup.
+onvif:
+  - name: Back Garden
+    uuid: 8f1c2e40-0000-4000-8000-00000000a002
+    hostname: 192.168.1.242
+
+    # Ports the VIRTUAL device exposes (on the container's own IP).
+    ports:
+      server: 8081     # Onvif SOAP + snapshot
+      rtsp: 8554       # forwarded to target.ports.rtsp
+      snapshot: 8580   # forwarded to target.ports.snapshot
+
+    highQuality:
+      rtsp: /cam/realmonitor?channel=2&subtype=0
+      snapshot: /onvif/snapshot
+      width: 2560
+      height: 1440
+      framerate: 20
+      bitrate: 4096
+      quality: 4.0
+
+    lowQuality:
+      rtsp: /cam/realmonitor?channel=2&subtype=1
+      snapshot: /onvif/snapshot
+      width: 640
+      height: 360
+      framerate: 15
+      bitrate: 512
+      quality: 1.0
+
+    # The REAL camera or recorder this proxies.
+    target:
+      hostname: 192.168.1.152
+      ports:
+        rtsp: 554
+        snapshot: 80

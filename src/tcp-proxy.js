@@ -26,15 +26,21 @@ export class TcpProxy {
             this.#track(client);
             this.#track(upstream);
 
-            const teardown = (error) => {
-                if (error && error.code !== 'ECONNRESET' && error.code !== 'EPIPE')
-                    this.#logger.debug(`proxy ${listenPort} -> ${this.#target} closed: ${error.message}`);
+            const teardown = () => {
                 client.destroy();
                 upstream.destroy();
             };
 
-            client.on('error', teardown);
-            upstream.on('error', teardown);
+            // 'close' passes a boolean, not an Error - keep the handlers separate
+            // so we never try to read .code/.message off `hadError`.
+            const onError = (error) => {
+                if (error.code !== 'ECONNRESET' && error.code !== 'EPIPE')
+                    this.#logger.debug(`proxy ${listenPort} -> ${this.#target}: ${error.message}`, { code: error.code });
+                teardown();
+            };
+
+            client.on('error', onError);
+            upstream.on('error', onError);
             client.on('close', teardown);
             upstream.on('close', teardown);
 

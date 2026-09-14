@@ -133,19 +133,20 @@ async function withUtcHourOffset(hours, fn) {
 }
 
 export async function createConfig(hostname, username, password, logger = console) {
+    // logger must provide info/error; main.js passes the structured logger.
     try {
         return await probeCamera(hostname, username, password);
     } catch (error) {
-        logger.error?.(error.message) ?? console.error(error.message);
+        logger.error(error.message);
 
         if (!error.message.includes('time check failed')) return null;
 
-        logger.info?.('Clock skew rejected by the camera, retrying with a shifted timestamp...');
+        logger.info('Clock skew rejected by the camera, retrying with a shifted timestamp...');
 
         try {
             return await withUtcHourOffset(1, () => probeCamera(hostname, username, password));
         } catch (retryError) {
-            logger.error?.(retryError.message) ?? console.error(retryError.message);
+            logger.error(retryError.message);
             return null;
         }
     }

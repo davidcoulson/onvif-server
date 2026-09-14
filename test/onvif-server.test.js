@@ -108,3 +108,16 @@ test('close() is safe to call twice', async () => {
     await server.close();
     await server.close();
 });
+
+test('close() is safe to call twice with discovery running', async () => {
+    const server = createServer(localCamera(), logger);
+    await server.startServer();
+    server.startDiscovery();
+
+    // dgram.close() throws on an already-closed socket, so the second call
+    // must be a no-op rather than an unhandled rejection.
+    await server.close();
+    await server.close();
+
+    assert.equal(server.address(), null);
+});

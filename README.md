@@ -1,4 +1,10 @@
 # Virtual Onvif Server
+
+> **This is a modernized fork.** Node 24+, ESM, 3 runtime dependencies instead of 7,
+> a fixed file-descriptor leak in WS-Discovery, `xml2js` bumped past CVE-2023-0842,
+> config validation, graceful shutdown and a test suite. See [MODERNIZATION.md](MODERNIZATION.md)
+> for the full list. Wire behaviour and `config.yaml` are unchanged from upstream v1.
+
 This is a simple Virtual Onvif Server that was originally developed to work around limitations in the third party support of Unifi Protect.
 It takes an existing RTSP Stream and builds a virtual Onvif device for it, so the stream can be consumed by Onvif compatible clients.
 
@@ -14,7 +20,7 @@ Run this tool on a Raspberry Pi or similar to split up a multi-channel Onvif dev
 ## Raspberry Pi Setup
 
 ### Prerequisites
-Ensure you are running Rapsberry OS 11 (Bullseye) or newer and have Node.js v16 or higher installed.
+Ensure you are running Raspberry Pi OS 11 (Bullseye) or newer and have **Node.js v24 or higher** installed.
 
 To check your version of Node.js run this command:
 ```bash
@@ -30,11 +36,51 @@ nvm install --lts
 ```
 
 ### Installation
-To install all required dependencies run:
+To install all required dependencies run (this fork commits a lockfile, so `npm ci` works):
 ```bash
 cd /path/to/onvif-server/
 npm install
 ```
+
+## Docker Compose (recommended)
+
+Rather than creating macvlan interfaces on the host by hand, let Docker do it.
+The macvlan network driver gives **each container its own MAC and IP on your
+LAN**, which is exactly what the manual `ip link` steps below are for - but
+declarative, and it survives a reboot.
+
+Run **one container per virtual Onvif device**, each with its own single-camera
+config file. See [`docker-compose.yml`](docker-compose.yml) and the examples in
+[`examples/config/`](examples/config).
+
+```
+docker compose up -d
+```
+
+Set `parent` to your LAN interface, point `subnet`/`gateway` at your network,
+and pick an `ip_range` your DHCP server does not hand out.
+
+> [!NOTE]
+> With macvlan the Docker host itself cannot reach these containers. That does
+> not matter when UniFi Protect runs on another machine; if you need host access
+> you will also need a macvlan shim interface on the host.
+
+### About the MAC addresses
+
+The upstream README says each virtual device "needs its own unique MAC address".
+That is worth stating precisely, because it shapes the whole setup:
+
+- **The MAC is never sent on the wire.** In this codebase it is used in exactly
+  one place - `getIpAddressFromMac()` - to look up which local IPv4 address to
+  bind to. It appears in no SOAP response and in no WS-Discovery payload.
+- **What is genuinely required is a distinct IP per virtual device**, because
+  each one binds its own HTTP/SOAP port and joins the discovery multicast group
+  on that address.
+- **You can skip MACs entirely** by setting `hostname:` directly in the config,
+  which is what the Compose examples do.
+
+macvlan is simply the usual way to get several IPs with distinct link-layer
+identities on one host - and with Compose you get that for free per container.
 
 ### Virtual Networks
 To properly work with Unifi Protect each virtual Onvif device needs to have its own unique MAC address.
